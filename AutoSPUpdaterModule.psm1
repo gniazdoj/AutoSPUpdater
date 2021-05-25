@@ -1,4 +1,7 @@
-﻿#region Install Updates
+#Author
+#https://github.com/brianlala/AutoSPUpdater
+
+#region Install Updates
 function InstallUpdatesFromPatchPath
 {
     [CmdletBinding()]
@@ -90,6 +93,7 @@ function InstallUpdatesFromPatchPath
     Write-Host -ForegroundColor White " - Finished installing SharePoint updates on " -NoNewline
     Write-Host -ForegroundColor Black -BackgroundColor Green "$env:COMPUTERNAME"
     WriteLine
+
 }
 #endregion
 
@@ -144,6 +148,7 @@ function Install-Remote
                                                                             StartTracing -Server $server; `
                                                                             Test-ServerConnection -Server $server; `
                                                                             Enable-RemoteSession -Server $server -plainPass $(ConvertFrom-SecureString $($credential.Password)) -launchPath `"$launchPath`"; `
+                                                                            Backup-IISConfiguration; `
                                                                             Start-RemoteUpdate -Server $server -plainPass $(ConvertFrom-SecureString $($credential.Password)) -launchPath `"$launchPath`" -patchPath `"$patchPath`" -spVer $spver $verboseSwitch; `
                                                                             Pause `"exit`"; `
                                                                             Stop-Transcript -ErrorAction SilentlyContinue}" -Verb Runas
@@ -567,7 +572,7 @@ function Clear-SPConfigurationCache
     # http://blogs.msdn.com/b/jamesway/archive/2011/05/23/sharepoint-2010-clearing-the-configuration-cache.aspx
     Try
     {
-        Write-Host -ForegroundColor White " - Clearing SP configuration cache..."
+            Write-Host -ForegroundColor White " - Clearing SP configuration cache for SharePoint 2010..."
         if ((Get-Service -Name SPTimerV4).Status -eq "Running")
         {
             # Stop SP Timer Service
@@ -609,6 +614,8 @@ function Clear-SPConfigurationCache
         Write-Host -ForegroundColor White " - Done clearing configuration cache."
     }
 }
+
+
 function Get-SPYear
 {
     $spYears = @{"14" = "2010"; "15" = "2013"; "16" = "2016"} # Can't use this hashtable to map SharePoint 2019 versions because it uses version 16 as well
@@ -629,3 +636,492 @@ function Get-SPYear
     return $spVer, $spYear
 }
 #endregion
+
+
+
+function DistributedCache(){
+
+    [CmdletBinding()]
+    param
+    (
+        #[String]$server,
+        [bool]$enable
+    )
+
+	if($enable){
+        Write-Host "`n`nProvisioning Distributed Cache on $env:COMPUTERNAME`n" -ForegroundColor Cyan
+       $DCattempts = 0
+        Do {
+            $instanceName ="SPDistributedCacheService Name=AppFabricCachingService"
+            $serviceInstance = Get-SPServiceInstance | ? {($_.service.tostring()) -eq $instanceName -and ($_.server.name) -eq $env:computername}
+            #only valid when one Servcie running on farm
+            #$serviceInstance = Get-SPServiceInstance | ? {$_.TypeName -like "Distributed Cache"}
+            $serviceInstance.Provision()
+
+            Start-Sleep -Seconds 10
+            write-host " - Attempt $DCattempts on $env:COMPUTERNAME with instance `"$($serviceInstance)`" current status is: `"$($serviceInstance.Status)`": ." -ForegroundColor White
+            $DCattempts++
+
+            if($DCattempts -eq 3){
+                Write-host " - Adding SPDistributedCacheServiceInstance intead." -ForegroundColor Cyan
+                Add-SPDistributedCacheServiceInstance
+            } 
+
+        }
+        While (($serviceInstance.Status -ne "Online") -and ($DCattempts -ne '4'))
+        if($DCattempts -eq '4'){
+        write-host "FAILED at $DCattempts try. Distribute DC manually!!" -ForegroundColor Red
+        }else{
+        write-host "Distributed Cache on $env:COMPUTERNAME has been Provisioned..." -ForegroundColor Green
+        }
+	}else{
+        Write-Host "`n`nUnprovisioning Distributed Cache on $env:COMPUTERNAME`n" -ForegroundColor Cyan
+        $instanceName ="SPDistributedCacheService Name=AppFabricCachingService"
+        $serviceInstance = Get-SPServiceInstance | ? {($_.service.tostring()) -eq $instanceName -and ($_.server.name) -eq $env:computername}
+        $serviceInstance.Unprovision()
+	}
+	
+}
+
+
+function Backup-IISConfiguration
+{
+  
+  $SiteManager = Get-IISServerManager
+  $SMs = $SiteManager.Sites
+
+  foreach ($SM in $SMs)
+  {
+    
+        $GWs = Get-Website $SM.name
+            foreach ($GW in $GWs){
+                if($sm.name -like '*GetOrganized*' -or $sm.name -like '*GO*' -or $sm.name -like '*SharePoint*'){
+                    $Filename = 'web.config'
+                    $PathToFile = $GW.physicalpath +'\'+ $Filename
+                    if($PathToFile -ne $null){
+                    if(get-item -path $PathToFile){
+                        #Write-host ' - Copying file' $PathToFile
+                        $date = Get-Date -format "yyyy_MM_dd-H_mm"
+                        Copy-Item $PathToFile -Destination $PathToFile-$date.bak -force 
+
+                        if(get-item -path $PathToFile-$date.bak){
+                            write-host "  - IIS Configuration on $env:COMPUTERNAME has been completed successfully with: $PathToFile" -ForegroundColor white
+                        }
+
+                    }
+
+                }else{
+                        write-host "  - There is some issues please check site name...." -ForegroundColor Red
+                        }
+                }
+                }
+
+  }
+}
+
+
+function Backup-SPFarmConfiguration
+{
+    [CmdletBinding()]
+    param
+    (
+        [String]$SPFarmBackupDirPath
+    )
+$SPFarmBackupDirName = "SPFarmBackup"
+if(!(Test-Path "$SPFarmBackupDirPath\$SPFarmBackupDirName")) {
+    New-Item -Path $SPFarmBackupDirPath -Name $SPFarmBackupDirName -ItemType "directory" -ErrorAction SilentlyContinue | Out-Null
+    Write-Host " - Backing up the SPFarm..." -ForegroundColor White
+    Backup-SPFarm -Directory $SPFarmBackupDirPath\$SPFarmBackupDirName -BackupMethod full -Percentage 5 -Force -ErrorAction Stop -ConfigurationOnly
+    Write-Host "  - Congratulations! The FULL backup completed successfully!" -ForegroundColor Cyan
+}else{
+    Write-Host " - Folder with SPFarmConfiguration already exist uder: `"$SPFarmBackupDirPath`"" -ForegroundColor White
+}
+}
+
+
+function Test-PendingReboot
+{
+if (Get-ChildItem "HKLM:\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" -EA Ignore) { return $true }
+if (Get-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -EA Ignore) { return $true }
+if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -EA Ignore) { return $true }
+try { 
+   $util = [wmiclass]"\\.\root\ccm\clientsdk:CCM_ClientUtilities"
+   $status = $util.DetermineIfRebootPending()
+   if(($status -ne $null) -and $status.RebootPending){
+     return $true
+   }
+}catch{}
+
+ return $false
+}
+
+function Set-WindowsFirewallRuleAction
+{
+    [CmdletBinding()]
+    param
+    (
+        [bool]$Action,
+        [String]$FirewallPortNumber
+
+    )
+	if($Action){
+        Write-Host " - Blocking traffic on port: $FirewallPortNumber ..." -ForegroundColor White
+        Get-NetFirewallPortFilter | ? LocalPort -eq $FirewallPortNumber | Get-NetFirewallRule | Set-NetFirewallRule -Action Block 
+        }else{
+        Write-Host " - Allowing traffic on port: $FirewallPortNumber ..." -ForegroundColor White
+        Get-NetFirewallPortFilter | ? LocalPort -eq $FirewallPortNumber | Get-NetFirewallRule | Set-NetFirewallRule -Action Allow 
+    }
+}
+
+function Test-InstalledFeatures
+{
+$missings = Get-SPContentDatabase | Test-SPContentDatabase | ? { $_.Category -eq "MissingFeature" }
+if($missings -ne $null){
+    write-host ' - Please review missing features in your installation:' -ForegroundColor White
+    $missings | ft -AutoSize
+    write-host 'Details:' -ForegroundColor White
+        foreach($Missing in $missings){
+            write-host '' -ForegroundColor White
+            write-host $missing.message -ForegroundColor Red 
+            return $true
+        }
+    }else{
+    return $false
+    }
+}
+
+
+function Test-FeaturesStatus
+{
+  $SPWebApps = get-SPWebApplication  
+
+  foreach ($SPWebApp in $SPWebApps)
+  {
+  $ContentDBColl = (Get-SPWebApplication -Identity $SPWebApp.URL).ContentDatabases
+      foreach ($contentDB in $ContentDBColl)
+      {
+           if($ContentDB.name -ne $null){
+             $TestDBs = Test-SPContentDatabase -Name $ContentDB.name -WebApplication $SPWebApp.URL
+                foreach ($TestDB in $TestDBs){
+                    if($TestDB.UpgradeBlocking -eq $true){
+                        Write-host 'Feature blockling upgrade?: ' $TestDB.UpgradeBlocking
+                        return $true
+                        }else{
+                        return $false
+
+                    }
+                }
+            } 
+
+      }
+  }
+}
+
+# Author
+#https://gist.github.com/ShauneDonohue/3d4f8cc78771c2bd35e5daa0c17ba41c
+
+function Update-ContentDatabasesMultiThreads{
+[CmdletBinding()]
+Param(
+[Parameter(Mandatory=$false, HelpMessage="The Farm account to connect to SharePoint")] [string] $farmaccount = "itlup\sharepoint",
+[Parameter(Mandatory=$false, HelpMessage="Web application URL to the use for upgrading")][string] $weburl = "https://test-partner.example.com/"
+)
+
+
+#$creds = (Get-Credential $farmaccount )
+
+Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue | Out-Null
+
+# Number of current threads to upgrade content databases in parallel.
+# This is limited to a max of logical processors on the box, but the really stress will be on the SQL server
+$maxUpgradeThreads = 4
+
+function Get-ProcessorCount() {
+    return [int](@(Get-WmiObject -Class Win32_Processor) | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+}
+
+function New-ContentDatabaseUpgradeJob() {
+    param(
+        [Parameter(Mandatory=$true)][string]$ContentDatabaseName,
+        [Parameter(Mandatory=$true)][System.Management.Automation.Runspaces.RunspacePool]$RunspacePool
+    )
+    $ErrorActionPreference = "Stop"
+    try {
+        # create an upgrade job
+        $upgradeJob = [System.Management.Automation.PowerShell]::Create()
+        # set the runspace pool
+        $upgradeJob.RunspacePool = $RunspacePool
+        # add the script block and the parameters to execute
+        $powershell = $upgradeJob.AddScript( $UpgradeContentDatabaseScriptBlock )
+        $powershell = $upgradeJob.AddParameter( "ContentDatabaseName", $ContentDatabaseName )
+ 
+        return $upgradeJob   
+    }
+    catch {
+        throw $_.Exception
+    }
+    finally {
+        $ErrorActionPreference = "Continue"
+    }
+}
+
+function New-RunspacePool() {
+    param([Parameter(Mandatory=$true)][int]$MaxRunspaces)
+    
+    $ErrorActionPreference = "Stop"
+    try
+    {
+        $warning = ""
+        # create a shared session state that imports the SharePoint Snap-In
+        $defaultSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $snapInInfo = $defaultSessionState.ImportPSSnapIn( "Microsoft.SharePoint.PowerShell", [ref]$warning )
+        $defaultSessionState.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+
+        # create the runspace pool that will be unique for all of the upgrade jobs
+        $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($defaultSessionState)
+        $added = $runspacePool.SetMinRunspaces(1)
+        $added = $runspacePool.SetMaxRunspaces($MaxRunspaces)
+        $runspacePool.Open()    
+        return $runspacePool
+    }
+    catch
+    {
+        throw $_.Exception
+    }
+    finally
+    {
+        $ErrorActionPreference = "Continue"
+    }
+}
+
+filter Write-ColorCodedTable {
+    param
+    (
+        [HashTable]$ColorMappings
+    )
+
+    $ForegroundColor = "White" # default color for table headers
+    if( $Host.UI.RawUI.ForegroundColor -eq "-1" )
+    {
+        $ForegroundColor = $Host.UI.RawUI.ForegroundColor
+    }
+
+    $lines = $_ -split '\r\n'
+
+    foreach( $line in $lines )
+    {
+        $ColorMappings.GetEnumerator() | % {
+            if($line -match $_.Key)
+            {
+                 $ForegroundColor = $_.Value
+            }
+        }
+
+        Write-Host $line -ForegroundColor $ForegroundColor
+    }
+}
+
+function updateContentDatabases($contentDatabaseNamesToUpgrade){
+    $resultColorHash = @{ 
+        # message regex                               = display color 
+        "No Upgrade Required|Completed|DEBUG" = "Green" 
+        "Error|Invalid|Failed|Unknown"        = "Red" 
+    }
+
+    $UpgradeContentDatabaseScriptBlock = {
+        param([string]$ContentDatabaseName)
+        $upgradeResultMessage = "Completed"
+
+        try
+        {
+            $contentDatabase = Get-SPContentDatabase | ? { $_.Name -eq $ContentDatabaseName }
+            if($contentDatabase -and $contentDatabase.NeedsUpgrade) {
+                $upgradeErrorMessage = $upgradeWarningMessage = ""
+                # we need to stagger start time to prevent upgrades from starting at the same time 
+                # because they will have a session naming conflict and cause the upgrade to fail
+                Start-Sleep -Seconds $( Get-Random -Minimum 5.0 -Maximum 60.0 )
+                $databaseUpgradeStopWatch = Measure-Command {
+                    $contentDatabase | Upgrade-SPContentDatabase -Confirm:$false -ErrorVariable upgradeErrorMessage -WarningVariable upgradeWarningMessage
+                }
+            }
+            elseif($contentDatabase -and !$contentDatabase.NeedsUpgrade) {
+                # return the object showing the db doesn't need to be upgraded
+                return New-Object PSObject -Property @{
+                    ContentDatabaseName = $ContentDatabaseName;
+                    ExecutionTime       = "0";
+                    Result              = "No Upgrade Required";
+                }
+            }
+        }
+        catch {
+            $upgradeResultMessage = $_.Exception.ToString()
+        }
+
+        if($upgradeWarningMessage) {
+            $upgradeResultMessage = $upgradeWarningMessage
+        }
+
+        if($upgradeErrorMessage) {
+            $upgradeResultMessage = $upgradeErrorMessage
+        }
+
+        return New-Object PSObject -Property @{
+            ContentDatabaseName = $ContentDatabaseName;
+            ExecutionTime       = $databaseUpgradeStopWatch.TotalSeconds.ToString("N1")
+            Result              = $upgradeResultMessage;
+        }
+    }
+    
+    # limit the number of threads to a max of the number of logical processsors on the box
+    if($maxUpgradeThreads -gt $(Get-ProcessorCount)) {
+        $maxUpgradeThreads = $(Get-ProcessorCount)
+        Write-Host "`n`tLimiting max threads to the number of logical processsors `"$($maxUpgradeThreads)`".`n" -ForegroundColor Yellow
+    }
+    # start the upgrades
+    $databaseUpgradeJobs = $lastCheckedCompletedUpgradeJobs = $databaseUpgradeResults = @()
+    $databaseUpgradeProgressCounter = 0
+    $warning = $null
+
+    # create the run space
+    $runspacePool = New-RunspacePool -MaxRunspaces $maxUpgradeThreads
+    Write-Host "`n`nCreating Content Database Upgrade Jobs`n" -ForegroundColor Green
+
+    # enumerate all the content databases to upgrade
+    $contentDatabaseNamesToUpgrade | % {
+        $databaseName = $_
+        try {
+            # Make sure the database exists
+            $contentDatabase = Get-SPContentDatabase -Identity $databaseName -ErrorAction SilentlyContinue
+            if($contentDatabase) {
+                Write-Host "`tQueuing upgrade job for database: $databaseName"
+                # don't crush the machine with starting jobs.
+                Start-Sleep -Seconds 5
+                # create the upgrade job
+                $contentDatabaseUpgradeJob = New-ContentDatabaseUpgradeJob -ContentDatabaseName $databaseName -RunspacePool $runspacePool
+
+                # add the job to our upgrade job list and start the job
+                $databaseUpgradeJobs += New-Object PSObject -Property @{
+                    PowerShell       = $contentDatabaseUpgradeJob;
+                    Runspace         = $contentDatabaseUpgradeJob.BeginInvoke();
+                    ContentDatabase  = $databaseName;
+                    UpgradeJobResult = $null;
+                    NeedsUpgrade     = $null;
+                }
+            }
+        }
+        catch {
+            Write-Host "`t`tError:   Error creating or starting upgrade job for database: $databaseName." -ForegroundColor Red
+            Write-host "`t`tDetails: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    if( $databaseUpgradeJobs.Count -gt 0 ) {
+        Write-Host "`nDatabase Upgrade Progress`n" -ForegroundColor Green
+        # keep looping until all the installation jobs are complete
+        do {
+            try {
+                # pause for a few seconds between checks for completed jobs
+                Start-Sleep -Seconds 5
+                # get a list of all the completed database jobs
+                $completedDatabaseUpgradeJobs = @($databaseUpgradeJobs | ? { $_.Runspace.IsCompleted })
+
+                # check if any more jobs completed since last check
+                if($lastCheckedCompletedUpgradeJobs.Count -ne $completedDatabaseUpgradeJobs.Count) {
+                    # print out the computer names for each job that completed since the last check
+                    $completedDatabaseUpgradeJobs | ? { $lastCheckedCompletedUpgradeJobs -notcontains $_ } | % {
+                        Write-Output "`t$(Get-Date) - $($_.ComputerName): Upgrade of $($_.ContentDatabase) has completed."
+                    }
+
+                    # update the list of completed jobs
+                    $lastCheckedCompletedUpgradeJobs = $completedDatabaseUpgradeJobs
+
+                    # update the progress bar
+                    Write-Progress `
+                        -Activity       "Content Database Upgrade Progress" `
+                        -Status         "Progress: $($completedDatabaseUpgradeJobs.Count) of $($databaseUpgradeJobs.Count) Upgrades Completed" `
+                        -PercentComplete $(($($Progress.Count)/$($databaseUpgradeJobs.Count))*100)
+                }
+            }
+            catch {
+                Write-Host "`t`tError:   Error checking for job completion status" -ForegroundColor Red
+                Write-host "`t`tDetails: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        while( $databaseUpgradeJobs | ? { !$_.Runspace.IsCompleted } )
+
+        try {
+            # collect the job results
+            $databaseUpgradeJobs | % {
+                $_.UpgradeJobResult = $_.PowerShell.EndInvoke($_.Runspace)
+            }
+
+            # pull the NeedsUpgrade property from the attached database
+            $databaseUpgradeJobs | % {
+                $_.NeedsUpgrade = $(Get-SPContentDatabase -Identity $_.ContentDatabase).NeedsUpgrade
+            }
+
+            # build an output object collection we can display and write to csv
+            $databaseUpgradeJobs | % {
+                $databaseUpgradeResults += New-Object PSObject -Property @{
+                    "Database"       = $_.ContentDatabase;
+                    "Execution Time" = $_.UpgradeJobResult | % { $_.ExecutionTime }; # hack for PowerShell 2.0
+                    "Upgrade Result" = $_.UpgradeJobResult | % { $_.Result };        # hack for PowerShell 2.0
+                    "Needs Upgrade"  = $_.NeedsUpgrade;
+                }
+            }
+
+            Write-Host "`nContent Database Upgrade Results`n" -ForegroundColor Green
+            # write out the results to the screen and .csv file
+            $databaseUpgradeResults | Sort Database | FT Database, "Upgrade Result", "Execution Time", "Needs Upgrade" -AutoSize | Out-String | Write-ColorCodedTable -ColorMappings $resultColorHash
+            $databaseUpgradeResults | Export-Csv -Path $outputFile -NoTypeInformation
+
+            if( $outputFile.IndexOfAny("\") -gt 0 ) {
+                Write-Output "`nUpgrade results written to $outputFile`n"    
+            }
+            else {
+                Write-Output "`nUpgrade results written to $((Get-Item -Path ".\" -Verbose).FullName)\$outputFile`n"
+            }
+        }
+        catch {
+            Write-Host "`t`tError:   Error upgrading content database: $databaseName." -ForegroundColor Red
+            Write-host "`t`tDetails: $($_.Exception.Message)" -ForegroundColor Red
+            return
+        }
+        finally {
+            if( $runspacePool -and $runspacePool.RunspacePoolStateInfo -and $runspacePool.RunspacePoolStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened) {
+                $runspacePool.Close()
+                $runspacePool.Dispose()
+            }
+        }
+    }
+}
+
+# Example: upgrade specific databases
+#$contentDatabaseNamesToUpgrade = @("SP2010_CONTENT_001", "SP2010_CONTENT_002", "SP2010_CONTENT_003" )
+
+# Example: upgrade all the content databases hosted on SQL01 
+#$contentDatabaseNamesToUpgrade = Get-SPContentDatabase | ? { $_.Server -eq "SQL01" } | % { $_.Name }
+
+# Example: upgrade all the content databases on the finance web application 
+#$contentDatabaseNamesToUpgrade = Get-SPContentDatabase | ? { $_.WebApplication.Url -match "finance.contoso.com" } | % { $_.Name }
+
+# Example: upgrade all the content databases attached to the SharePoint farm
+$contentDatabaseNamesToUpgrade = Get-SPContentDatabase | % { $_.Name }
+
+# log file to write the results to
+$outputFile = "Upgrade-ContentDatabaseB2B.results.{0}.csv" -f [DateTime]::Now.ToString("yyyy-MM-dd_hh-mm-ss")
+
+$startTime = Get-Date
+
+# hack for powershell 2.0, so we always have an array of database names
+if($contentDatabaseNamesToUpgrade.GetType().Name -eq "String") {
+    $contentDatabaseNamesToUpgrade = @($contentDatabaseNamesToUpgrade)
+}
+
+updateContentDatabases $contentDatabaseNamesToUpgrade
+
+$TimeSpan = New-TimeSpan -Start $startTime -End (Get-Date)
+Write-Output "`n`nExection Time: $($TimeSpan.Hours):$($TimeSpan.Minutes):$($TimeSpan.Seconds)`n"
+
+}
+
