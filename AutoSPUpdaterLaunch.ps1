@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Applies SharePoint 2010/2013/2016/2019 updates (Service Packs + Cumulative/Public Updates) farm-wide, centrally from any server in the farm.
 .DESCRIPTION
@@ -31,6 +31,7 @@
 .LINK
     https://github.com/brianlala/autospsourcebuilder
     http://blogs.msdn.com/b/russmax/archive/2013/04/01/why-sharepoint-2013-cumulative-update-takes-5-hours-to-install.aspx
+    https://gist.github.com/ShauneDonohue
 .NOTES
     Created & maintained by Brian Lalancette (@brianlala), 2012-2018.
 #>
@@ -150,14 +151,80 @@ UnblockFiles -path $patchPath
 $farmServers | ForEach-Object {$rolesPerServer.Add($_.Name,"$($_.Role)")}
 if (($patchPath -like "*:*" -or $launchPath -like "*:*") -and $farmServers.Count -gt 1)
 {
-    Write-Host -ForegroundColor Yellow " - The path where updates reside ($patchPath) and/or where the script"
-    Write-Host -ForegroundColor Yellow " - is being run from ($launchPath) is/are identified by a local drive letter."
-    Write-Host -ForegroundColor Yellow " - You should either use a UNC path that all farm servers can access (recommended),"
-    Write-Host -ForegroundColor Yellow " - or create identical paths and copy all required files on each farm server."
-    Write-Host -ForegroundColor White " - Ctrl-C to exit, or"
-    Pause "continue updating" "y"
-}
+    #Check pending reboot
+        if(Test-PendingReboot -eq $true){
+        write-host " - Please perform reboot before continue." -ForegroundColor Red
+        $Message = read-host  " Press `"c`" to continue at your own risk!!!."
+        
+            if($Message -eq 'c'){
+                write-host "   - Continuing..." -ForegroundColor red
+                }else{exit}
+        }else{
+        write-host " - Server doesn't need a reboot" -ForegroundColor white
+        }
+    # Check for missing features
+        if(Test-InstalledFeatures -eq $true){
+        write-host " - Please review missing features before continue." -ForegroundColor Red
+        $Message = read-host  " Press `"c`" to continue at your own risk!!!."
+        
+            if($Message -eq 'c'){
+                write-host "   - Continuing..." -ForegroundColor red
+                }else{exit}
+        }else{
+            write-host ' - There is no any missing features' -ForegroundColor White
+        }
 
+    # Check features blocking update
+        if(Test-FeaturesStatus -eq $true){
+        write-host " - Please review features blocing update before continue." -ForegroundColor Red
+        $Message = read-host  " Press `"c`" to continue at your own risk!!!."
+        
+            if($Message -eq 'c'){
+                write-host "   - Continuing..." -ForegroundColor red
+                }else{exit}
+        }else{
+            write-host ' - There is no any feature blocing update. ' -ForegroundColor White
+        }
+
+    Write-host " - Checking for patch and configuration files exist in defined location"
+    $ConfigurationFiles = "AutoSPUpdaterModule.psm1", "AutoSPUpdaterConfigureRemoteTarget.ps1"
+
+    foreach ($ConfigurationFile in $ConfigurationFiles) {
+        $found=$false; 
+        Get-ChildItem -Path $launchPath -Recurse | % {if($ConfigurationFile -eq $_.Name) {Write-Host '  - '$ConfigurationFile ' Exists' -foregroundcolor White; $found=$true;CONTINUE }$found=$false;} -END {if($found -ne $true){ Write-Host ' -'$ConfigurationFile ' file missing' -foregroundcolor red}}
+    }
+
+    #Take SPFarm backup
+    if (Confirm-LocalSession) {
+        $SPFarmBackupDirNames = $launchPath.substring(3)
+        $SPFarmBackupDirName = "\\$env:COMPUTERNAME\c$\$SPFarmBackupDirNames"
+        Backup-SPFarmConfiguration -SPFarmBackupDirPath "$SPFarmBackupDirName"
+    }
+    #Take backup of IIS web.config
+        Write-host " - Taking Backup of IIS Configuration" -ForegroundColor White
+        Backup-IISConfiguration
+
+    #Disable Windows Firewall existing rules with defined port
+    Set-WindowsFirewallRuleAction -Action $true -FirewallPortNumber 80
+
+    $updatesToInstallPath = Get-ChildItem -Path "$patchPath" -Include office2010*.exe,ubersrv*.exe,ubersts*.exe,*pjsrv*.exe,sharepointsp2013*.exe,coreserver201*.exe,sts201*.exe,wssloc201*.exe,svrproofloc201*.exe,oserver*.exe,wac*.exe,oslpksp*.exe -Recurse -ErrorAction SilentlyContinue 
+    $updatesToInstall = Split-Path $updatesToInstallPath -leaf
+    
+    ForEach ($updateToInstall in $updatesToInstall){
+
+        $found=$false; 
+        Get-ChildItem -Path "$patchPath" -Recurse | % {if($updateToInstall -eq $_.Name) {Write-Host ' -'$updateToInstall ' Exists' -foregroundcolor White; $found=$true;CONTINUE }$found=$false;} -END {if($found -ne $true){ Write-Host ' -'$updateToInstall ' file missing' -foregroundcolor red}}
+    }
+    if($found -eq $false){
+
+        Write-Host -ForegroundColor Yellow " - The path where updates reside ($patchPath) and/or where the script"
+        Write-Host -ForegroundColor Yellow " - is being run from ($launchPath) is/are identified by a local drive letter."
+        Write-Host -ForegroundColor Yellow " - You should either use a UNC path that all farm servers can access (recommended),"
+        Write-Host -ForegroundColor Yellow " - or create identical paths and copy all required files on each farm server."
+        Write-Host -ForegroundColor White " - Ctrl-C to exit, or"
+        Pause "continue updating" "y"
+    }
+}
 if ((Confirm-LocalSession) -and $farmServers.Count -gt 1) # Only do this stuff on the first (local) server, and only if we have other servers in the farm.
 {
     Write-Host -ForegroundColor White " - Updating $env:COMPUTERNAME and additional farm server(s):"
@@ -306,14 +373,20 @@ else
 InstallUpdatesFromPatchPath -patchPath $patchPath -spVer $spVer @verboseParameter
 #endregion
 
-#region Clear Configuration Cache
-Clear-SPConfigurationCache
-#endregion
+
 
 #region Start Services
 # Only really need to do this for pre-SP2016
 if ($spVer -le 15)
 {
+
+#region Clear Configuration Cache
+#start only for SharePoint2010
+
+Clear-SPConfigurationCache
+
+#endregion
+
     Write-Host -ForegroundColor White " - Re-enabling & starting services..."
     ForEach ($service in $servicesToStart)
     {
@@ -400,7 +473,10 @@ if (Test-UpgradeRequired -eq $true)
         }
         #endregion
         $databaseUpgradeAttempted = $true
-        Update-ContentDatabases -spVer $spVer @verboseParameter
+
+        Update-ContentDatabasesMultiThreads
+        #Orig - sequence update
+        #Update-ContentDatabases -spVer $spVer @verboseParameter
     }
     else
     {
@@ -409,6 +485,8 @@ if (Test-UpgradeRequired -eq $true)
         $databaseUpgradeAttempted = $false
     }
     #endregion
+
+
     # Good post for troubleshooting PSConfig: http://itgroove.net/mmman/2015/04/29/how-to-resolve-failures-in-the-sharepoint-product-config-psconfig-tool/
     Write-Host -ForegroundColor Cyan " - The script has determined that PSConfig needs to be run on this server ($env:COMPUTERNAME)."
     Write-Host -ForegroundColor White " - Running: $PSConfig"
@@ -429,6 +507,14 @@ if (Test-UpgradeRequired -eq $true)
         $passThruParameter = @{}
     }
     $attemptNumber = 1
+    $instanceName ="SPDistributedCacheService Name=AppFabricCachingService"
+    $serviceInstance = Get-SPServiceInstance | ? {($_.service.tostring()) -eq $instanceName -and ($_.server.name) -eq $env:computername}
+    if($serviceInstance -ne $null){
+        DistributedCache -enable $false
+        $DCToProvision = $true
+    }
+
+    Pause "proceed with farm configuration wizard (PSConfig.exe)" "y"
     Start-Process -FilePath $PSConfig -ArgumentList "-cmd upgrade -inplace b2b -wait -force -cmd applicationcontent -install -cmd installfeatures -cmd secureresources" -NoNewWindow -Wait @passThruParameter
     $PSConfigLastError = Test-PSConfig
     while (!([string]::IsNullOrEmpty($PSConfigLastError)) -and $attemptNumber -le 1)
@@ -437,9 +523,12 @@ if (Test-UpgradeRequired -eq $true)
         Write-Host -ForegroundColor White " - An error occurred running PSConfig, trying again ($attemptNumber)..."
         Start-Sleep -Seconds 5
         $attemptNumber += 1
+        Pause "proceed with farm configuration wizard (PSConfig.exe)" "y"
         Start-Process -FilePath $PSConfig -ArgumentList "-cmd upgrade -inplace b2b -wait -force -cmd applicationcontent -install -cmd installfeatures -cmd secureresources" -NoNewWindow -Wait -PassThru
         $PSConfigLastError = Test-PSConfig
     }
+
+
     # If we've attempted 2 times and we're still getting an error with PSConfig, launch the GUI
     if ($attemptNumber -ge 2 -and !([string]::IsNullOrEmpty($PSConfigLastError)))
     {
@@ -457,9 +546,28 @@ if (Test-UpgradeRequired -eq $true)
     {
         Write-Host -ForegroundColor White " - PSConfig completed successfully."
     }
+
+     #Write-host " - Removing SP shell before provisioning." -ForegroundColor White
+     #Remove-PSSnapin Microsoft.SharePoint.PowerShell
+     if($DCToProvision -eq $true){
+        #Import-SharePointPowerShell
+        Write-host "Please provision DistributedCache manually... Open new PowerShell window and copy/paste code: `n" -ForegroundColor Red
+        write-host 'Add-PsSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue' -ForegroundColor DarkYellow
+        Write-host '$instanceName ="SPDistributedCacheService Name=AppFabricCachingService"' -ForegroundColor DarkYellow
+        write-host '$serviceInstance = Get-SPServiceInstance | ? {($_.service.tostring()) -eq $instanceName -and ($_.server.name) -eq $env:computername}' -ForegroundColor DarkYellow
+        write-host '$serviceInstance.Provision()'  -ForegroundColor DarkYellow
+        write-host "`n or add another instance if it's next server with that service `n"
+        write-host 'Add-PsSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue' -ForegroundColor DarkYellow
+        write-host 'Add-SPDistributedCacheServiceInstance' -ForegroundColor DarkYellow
+
+     }
+    #Enable Windows Firewall existing rules with defined port
+    Set-WindowsFirewallRuleAction -Action $false -FirewallPortNumber 80
+
     Clear-Variable -Name PSConfigLastError -ErrorAction SilentlyContinue
     Clear-Variable -Name PSConfigLog -ErrorAction SilentlyContinue
     Clear-Variable -Name retryNum -ErrorAction SilentlyContinue
+
 }
 else
 {
@@ -539,3 +647,4 @@ If (!$aborted)
     Remove-ItemProperty -Path "HKLM:\SOFTWARE\AutoSPUpdater\" -Name "LogTime" -ErrorAction SilentlyContinue
 }
 #endregion
+
